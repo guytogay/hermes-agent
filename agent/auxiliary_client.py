@@ -1175,6 +1175,10 @@ _MINIMAX_VISION_MODEL = "MiniMax-VL-01"
 
 def _try_minimax() -> Tuple[Optional[OpenAI], Optional[str]]:
     """Try to create a MiniMax vision client using MINIMAX_CN_API_KEY."""
+    # Load .env so MINIMAX_CN_API_KEY is available when called from hot paths
+    # (e.g. vision_analyze_tool) that don't go through the main agent init.
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.expanduser("~/.hermes"), ".env"), override=False)
     api_key = os.getenv("MINIMAX_CN_API_KEY", "").strip()
     if not api_key:
         # Also try the generic MINIMAX_API_KEY env var
@@ -1204,6 +1208,9 @@ async def _call_minimax_vision(
     import urllib.error
     import json as _json
 
+    # Load .env so MINIMAX_CN_API_KEY is available when called from hot paths.
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.expanduser("~/.hermes"), ".env"), override=False)
     api_key = os.getenv("MINIMAX_CN_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("MINIMAX_CN_API_KEY not set for MiniMax-CN vision")
@@ -1271,7 +1278,10 @@ async def _call_minimax_vision(
                 msg_err = result.get("base_resp", {}).get("status_msg", "unknown error")
                 raise RuntimeError(f"MiniMax vision API error {status}: {msg_err}")
             content = result.get("content", "")
-            return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+            # Return a struct-like object so extract_content_or_reasoning can access .choices
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
     except urllib.error.HTTPError as e:
         body = e.read().decode() if e.fp else ""
         raise RuntimeError(f"MiniMax vision HTTP {e.code}: {body[:500]}")
