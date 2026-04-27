@@ -3800,7 +3800,9 @@ async def async_call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     # ── MiniMax CN vision: use dedicated /v1/coding_plan/vlm endpoint ──────
-    if resolved_provider == "minimax-cn" and task == "vision":
+    # Route if provider is minimax-cn, or if the model is MiniMax-VL-01
+    # (the model name is unambiguous — it only works via the VLM endpoint).
+    if (resolved_provider == "minimax-cn" or final_model == "MiniMax-VL-01") and task == "vision":
         return await _call_minimax_vision(final_model, messages, effective_extra_body, effective_timeout)
 
     try:
