@@ -242,6 +242,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
 _PROVIDER_VISION_MODELS: Dict[str, str] = {
     "xiaomi": "mimo-v2.5",
     "zai": "glm-5v-turbo",
+    "minimax-cn": "MiniMax-VL-01",
 }
 
 # Providers whose endpoint does not accept image input, even though the
@@ -285,7 +286,7 @@ NOUS_EXTRA_BODY = {"tags": ["product=hermes-agent"]}
 auxiliary_is_nous: bool = False
 
 # Default auxiliary models per provider
-_OPENROUTER_MODEL = "google/gemini-3-flash-preview"
+_OPENROUTER_MODEL = "meta-llama/llama-4-scout"
 _NOUS_MODEL = "google/gemini-3-flash-preview"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -1166,6 +1167,116 @@ def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
                    default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+
+
+_MINIMAX_VISION_BASE_URL = "https://api.minimaxi.com"
+_MINIMAX_VISION_MODEL = "MiniMax-VL-01"
+
+
+def _try_minimax() -> Tuple[Optional[OpenAI], Optional[str]]:
+    """Try to create a MiniMax vision client using MINIMAX_CN_API_KEY."""
+    api_key = os.getenv("MINIMAX_CN_API_KEY", "").strip()
+    if not api_key:
+        # Also try the generic MINIMAX_API_KEY env var
+        api_key = os.getenv("MINIMAX_API_KEY", "").strip()
+    if not api_key:
+        return None, None
+    logger.debug("Auxiliary client: MiniMax vision")
+    return OpenAI(api_key=api_key, base_url=_MINIMAX_VISION_BASE_URL), _MINIMAX_VISION_MODEL
+
+
+async def _call_minimax_vision(
+    model: Optional[str],
+    messages: list,
+    extra_body: Optional[dict],
+    timeout: Optional[float],
+) -> Any:
+    """Call MiniMax CN vision endpoint /v1/coding_plan/vlm with OpenAI-style messages.
+
+    MiniMax's vision API uses a dedicated endpoint with format:
+      POST /v1/coding_plan/vlm
+      Body: {"prompt": "...", "image_url": "data:image/..."}
+
+    The messages are converted from OpenAI vision format to MiniMax's expected format.
+    """
+    import asyncio
+    import urllib.request
+    import urllib.error
+    import json as _json
+
+    api_key = os.getenv("MINIMAX_CN_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("MINIMAX_CN_API_KEY not set for MiniMax-CN vision")
+
+    base_url = _MINIMAX_VISION_BASE_URL.rstrip("/")
+    endpoint = f"{base_url}/v1/coding_plan/vlm"
+
+    # Extract text prompt and image from OpenAI-style vision messages
+    prompt_parts = []
+    image_b64 = None
+
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if block.get("type") == "text":
+                    prompt_parts.append(block.get("text", ""))
+                elif block.get("type") == "image_url":
+                    url = block.get("image_url", {}).get("url", "")
+                    # Extract base64 data URL
+                    if url.startswith("data:"):
+                        image_b64 = url
+                    elif url.startswith("http"):
+                        # Download remote image
+                        try:
+                            with urllib.request.urlopen(url, timeout=15) as resp:
+                                img_data = resp.read()
+                                import base64
+                                image_b64 = f"data:image/png;base64,{base64.b64encode(img_data).decode()}"
+                        except Exception:
+                            pass
+                elif block.get("type") == "image":
+                    # Anthropic format: source with base64
+                    src = block.get("source", {})
+                    if src.get("type") == "base64":
+                        mt = src.get("media_type", "image/png")
+                        data = src.get("data", "")
+                        image_b64 = f"data:{mt};base64,{data}"
+        elif isinstance(content, str):
+            prompt_parts.append(content)
+
+    prompt = " ".join(prompt_parts) if prompt_parts else "Describe this image."
+
+    if not image_b64:
+        raise ValueError("No image found in vision messages for MiniMax-CN")
+
+    payload = _json.dumps({
+        "prompt": prompt,
+        "image_url": image_b64,
+    }).encode()
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        req = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+        with await asyncio.get_event_loop().run_in_executor(
+            None, lambda: urllib.request.urlopen(req, timeout=timeout or 60)
+        ) as resp:
+            result = _json.loads(resp.read())
+            status = result.get("base_resp", {}).get("status_code", 0)
+            if status != 0:
+                msg_err = result.get("base_resp", {}).get("status_msg", "unknown error")
+                raise RuntimeError(f"MiniMax vision API error {status}: {msg_err}")
+            content = result.get("content", "")
+            return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        raise RuntimeError(f"MiniMax vision HTTP {e.code}: {body[:500]}")
+    except Exception as e:
+        raise RuntimeError(f"MiniMax vision failed: {e}") from e
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -2474,6 +2585,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
 
 
 _VISION_AUTO_PROVIDER_ORDER = (
+    "minimax-cn",
     "openrouter",
     "nous",
 )
@@ -2490,6 +2602,8 @@ def _resolve_strict_vision_backend(
     provider = _normalize_vision_provider(provider)
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
+    if provider == "minimax" or provider == "minimax-cn":
+        return _try_minimax()
     if provider == "openrouter":
         return _try_openrouter()
     if provider == "nous":
@@ -3674,6 +3788,10 @@ async def async_call_llm(
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    # ── MiniMax CN vision: use dedicated /v1/coding_plan/vlm endpoint ──────
+    if resolved_provider == "minimax-cn" and task == "vision":
+        return await _call_minimax_vision(final_model, messages, effective_extra_body, effective_timeout)
 
     try:
         return _validate_llm_response(
