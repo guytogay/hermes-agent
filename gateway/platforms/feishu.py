@@ -3160,7 +3160,7 @@ class FeishuAdapter(BasePlatformAdapter):
         raw_content = getattr(message, "content", "") or ""
         raw_type = getattr(message, "message_type", "") or ""
         message_id = str(getattr(message, "message_id", "") or "")
-        logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
+        logger.info("[Feishu] Received raw message type=%s message_id=%s content_preview=%r", raw_type, message_id, raw_content[:200])
 
         normalized = normalize_feishu_message(
             message_type=raw_type,

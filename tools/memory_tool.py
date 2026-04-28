@@ -29,6 +29,7 @@ import os
 import re
 import tempfile
 from contextlib import contextmanager
+
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -122,6 +123,109 @@ class MemoryStore:
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        # Semantic search: lazy-loaded MiniLM model and cache
+        self._minilm_model = None
+        self._minilm_device = None
+        self._minilm_entry_cache: Dict[str, Any] = {}  # entry → (vector, metadata)
+
+    def _get_minilm_model(self):
+        """Lazily load MiniLM model for semantic search."""
+        if self._minilm_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                import torch
+                self._minilm_device = "cuda" if torch.cuda.is_available() else "cpu"
+                # paraphrase-multilingual-MiniLM-L12-v2: 384d, multilingua
+                self._minilm_model = SentenceTransformer(
+                    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                    device=self._minilm_device,
+                )
+                logger.info("MiniLM semantic search loaded (device=%s)", self._minilm_device)
+            except Exception as e:
+                logger.warning("MiniLM model load failed: %s — semantic search disabled", e)
+                self._minilm_model = False  # False = tried and failed, don't retry
+        return self._minilm_model if self._minilm_model else None
+
+    def _encode_entries(self, entries: List[str]):
+        """Encode entries into vectors, caching results by entry text."""
+        model = self._get_minilm_model()
+        if model is None:
+            return None
+
+        # Find entries not yet encoded
+        uncached = [e for e in entries if e not in self._minilm_entry_cache]
+        if uncached:
+            try:
+                vectors = model.encode(uncached, convert_to_numpy=True, normalize_embeddings=True)
+                for entry, vec in zip(uncached, vectors):
+                    self._minilm_entry_cache[entry] = vec
+            except Exception as e:
+                logger.warning("MiniLM encoding failed: %s", e)
+                return None
+
+        return [self._minilm_entry_cache[e] for e in entries]
+
+    def prefetch(self, query: str, target: str = "memory", top_k: int = 5, threshold: float = 0.2) -> str:
+        """Semantic search over memory entries using MiniLM.
+
+        Returns a formatted string of the top-k most relevant entries,
+        or empty string if nothing exceeds the similarity threshold.
+        """
+        if not query or not query.strip():
+            return ""
+
+        entries = self._entries_for(target)
+        if not entries:
+            return ""
+
+        model = self._get_minilm_model()
+        if model is None:
+            # Fallback: keyword match
+            q_lower = query.lower()
+            scored = [(e, 1.0) for e in entries if q_lower in e.lower()]
+            if not scored:
+                return ""
+            scored.sort(key=lambda x: x[1], reverse=True)
+            top = scored[:top_k]
+            return self._format_prefetch_results([e for e, _ in top], target)
+
+        try:
+            # Encode query
+            q_vec = model.encode(query, convert_to_numpy=True, normalize_embeddings=True)
+
+            # Encode entries (with caching)
+            entry_vecs = self._encode_entries(entries)
+            if entry_vecs is None:
+                return ""
+
+            # Cosine similarity = dot product (already normalized)
+            scored = []
+            for entry, vec in zip(entries, entry_vecs):
+                sim = float(q_vec.dot(vec))
+                if sim >= threshold:
+                    scored.append((entry, sim))
+
+            if not scored:
+                return ""
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            top = scored[:top_k]
+
+            return self._format_prefetch_results([e for e, _ in top], target)
+
+        except Exception as e:
+            logger.warning("Semantic prefetch failed: %s", e)
+            return ""
+
+    def _format_prefetch_results(self, entries: List[str], target: str) -> str:
+        """Format matched entries as a fenced block for injection."""
+        if not entries:
+            return ""
+        label = "MEMORY" if target == "memory" else "USER"
+        lines = [f"=== {label} (semantic match) ==="]
+        for e in entries:
+            lines.append(f"• {e}")
+        return "\n".join(lines)
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""

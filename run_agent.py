@@ -1665,6 +1665,10 @@ class AIAgent:
         self._memory_store = None
         self._memory_enabled = False
         self._user_profile_enabled = False
+        # Tracks whether semantic prefetch found hits this turn — used to
+        # suppress the full-memory snapshot in the system prompt when we have
+        # more targeted semantic results to avoid duplication.
+        self._has_builtin_semantic_hit = False
         self._memory_nudge_interval = 10
         self._turns_since_memory = 0
         self._iters_since_skill = 0
@@ -4870,11 +4874,15 @@ class AIAgent:
             prompt_parts.append(system_message)
 
         if self._memory_store:
-            if self._memory_enabled:
+            # Skip full-memory snapshot when we have semantic prefetch hits this
+            # turn — the targeted semantic results are injected per-turn instead,
+            # so we avoid sending duplicate full content to save tokens.
+            if self._memory_enabled and not self._has_builtin_semantic_hit:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
                     prompt_parts.append(mem_block)
-            # USER.md is always included when enabled.
+            # USER.md is always included when enabled — semantic USER hits are
+            # also injected per-turn, but USER is lower-volume so we keep it.
             if self._user_profile_enabled:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
@@ -10514,6 +10522,22 @@ class AIAgent:
             except Exception:
                 pass
 
+        # Built-in memory (MEMORY.md): semantic search with MiniLM
+        _builtin_prefetch_cache = ""
+        self._has_builtin_semantic_hit = False
+        if self._memory_store and self._memory_enabled:
+            try:
+                _query = original_user_message if isinstance(original_user_message, str) else ""
+                if _query:
+                    _mem_result = self._memory_store.prefetch(_query, target="memory")
+                    _usr_result = self._memory_store.prefetch(_query, target="user")
+                    _parts = [p for p in [_mem_result, _usr_result] if p]
+                    if _parts:
+                        _builtin_prefetch_cache = "\n\n".join(_parts)
+                        self._has_builtin_semantic_hit = True
+            except Exception:
+                pass
+
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
@@ -10658,6 +10682,8 @@ class AIAgent:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
                         if _fenced:
                             _injections.append(_fenced)
+                    if _builtin_prefetch_cache:
+                        _injections.append(_builtin_prefetch_cache)
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
                     if _injections:
