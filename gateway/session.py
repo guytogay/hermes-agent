@@ -892,13 +892,50 @@ class SessionStore:
                     # Track whether the expired session had any real conversation
                     reset_had_activity = entry.total_tokens > 0
                     db_end_session_id = entry.session_id
+                    session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                    _resume_pending_entry = False
             else:
                 was_auto_reset = False
                 auto_reset_reason = None
                 reset_had_activity = False
 
-            # Create new session
-            session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                # Before creating a brand-new session, check if the DB already has
+                # an active session for this source.  This handles the case where
+                # the gateway restarted non-gracefully and sessions.json was wiped:
+                # the old session is still in SQLite with ended_at=NULL.
+                # Reusing it (with resume_pending=True) keeps the session_id stable
+                # so load_transcript() can recover the full history.
+                _existing_session_id = None
+                if self._db:
+                    try:
+                        # Find the most recent active session for this user/platform
+                        # that has actual messages.  Use direct SQL since search_sessions
+                        # filters by platform source, not by user_id.
+                        cursor = self._db._conn.execute(
+                            """
+                            SELECT id FROM sessions
+                            WHERE ended_at IS NULL
+                              AND message_count > 0
+                              AND user_id = ?
+                            ORDER BY started_at DESC
+                            LIMIT 1
+                            """,
+                            (source.user_id,),
+                        )
+                        row = cursor.fetchone()
+                        if row:
+                            _existing_session_id = row["id"]
+                    except Exception:
+                        pass
+
+                if _existing_session_id:
+                    # Re-use the existing session from DB instead of creating a new one.
+                    session_id = _existing_session_id
+                    _resume_pending_entry = True
+                else:
+                    session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                    _resume_pending_entry = False
+
 
             entry = SessionEntry(
                 session_key=session_key,
@@ -914,6 +951,13 @@ class SessionStore:
                 reset_had_activity=reset_had_activity,
             )
 
+            # If we found and re-used an existing session from DB, mark it as
+            # resume_pending so the agent knows to load its full transcript.
+            if _resume_pending_entry:
+                entry.resume_pending = True
+                entry.resume_reason = "non_graceful_restart_recovery"
+                entry.last_resume_marked_at = now
+
             self._entries[session_key] = entry
             self._save()
             db_create_kwargs = {
@@ -923,13 +967,15 @@ class SessionStore:
             }
 
         # SQLite operations outside the lock
-        if self._db and db_end_session_id:
+        # When _resume_pending_entry=True, the session already exists in DB
+        # with ended_at=NULL, so we skip both end_session and create_session.
+        if self._db and db_end_session_id and not _resume_pending_entry:
             try:
                 self._db.end_session(db_end_session_id, "session_reset")
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
 
-        if self._db and db_create_kwargs:
+        if self._db and db_create_kwargs and not _resume_pending_entry:
             try:
                 self._db.create_session(**db_create_kwargs)
             except Exception as e:

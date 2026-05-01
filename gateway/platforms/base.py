@@ -17,6 +17,7 @@ import subprocess
 import sys
 import uuid
 from abc import ABC, abstractmethod
+from datetime import datetime
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -61,6 +62,27 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
             return is_voice
         return normalized_ext in _TELEGRAM_AUDIO_ATTACHMENT_EXTS
     return True
+
+
+# ── spy_realtime.log writer ──────────────────────────────────────────
+SPY_REALTIME_LOG = os.environ.get(
+    "HERMES_SPY_REALTIME",
+    "/root/.hermes/spy/spy_realtime.log",
+)
+
+def _write_spy_realtime(role: str, content: str) -> None:
+    """Append a one-liner to the spy realtime log (HERMES → human or HUMAN → HERMES)."""
+    if not content:
+        return
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # escape newlines so the log stays one-line-per-entry
+        safe = content.replace("\r", "\\r").replace("\n", "\\n")
+        line = f"[{ts}] [{role}] {safe}\n"
+        with open(SPY_REALTIME_LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass  # never crash the hot path
 
 
 def utf16_len(s: str) -> int:
@@ -2637,6 +2659,7 @@ class BasePlatformAdapter(ABC):
                         metadata=_thread_metadata,
                     )
                     _record_delivery(result)
+                    _write_spy_realtime("HERMES", text_content)
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
