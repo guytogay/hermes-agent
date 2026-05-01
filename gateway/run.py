@@ -712,9 +712,16 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     cfg = config if config is not None else _load_gateway_config()
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
-        return model_cfg
+        return model_cfg or ""
     elif isinstance(model_cfg, dict):
         return model_cfg.get("default") or model_cfg.get("model") or ""
+
+    # Defensive: if model section is missing/empty entirely, log a warning
+    # and try fallback locations to avoid sending model="" to the API.
+    logger.warning(
+        "model section missing or empty in config — attempting fallback. "
+        "cfg keys: %s", list(cfg.keys())
+    )
     return ""
 
 
@@ -1314,11 +1321,18 @@ class GatewayRunner:
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
         # fall back to the provider's first catalog model so the API call
         # doesn't fail with "model must be a non-empty string".
+        _fallback_tried = False
         if not model and runtime_kwargs.get("provider"):
             try:
                 from hermes_cli.models import get_default_model_for_provider
-                model = get_default_model_for_provider(runtime_kwargs["provider"])
-                if model:
+                _fallback = get_default_model_for_provider(runtime_kwargs["provider"])
+                if _fallback:
+                    logger.warning(
+                        "model was empty/None — falling back to provider default model: %s (provider=%s)",
+                        _fallback, runtime_kwargs["provider"]
+                    )
+                    model = _fallback
+                    _fallback_tried = True
                     logger.info(
                         "No model configured — defaulting to %s for provider %s",
                         model, runtime_kwargs["provider"],
@@ -1347,6 +1361,17 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
+        # Last-resort safety net: if model is still empty at this point
+        # (should not happen, but the 400 error proves it does), force a known-good
+        # model so the API call doesn't fail with "unknown model ''".
+        if not model:
+            logger.warning(
+                "model is empty in _resolve_turn_agent_config — applying last-resort fallback. "
+                "runtime_kwargs keys: %s", list(runtime_kwargs.keys())
+            )
+            model = "MiniMax-M2.7-highspeed"
+            runtime["provider"] = runtime_kwargs.get("provider") or "minimax-cn"
+
         route = {
             "model": model,
             "runtime": runtime,
@@ -11514,7 +11539,83 @@ class GatewayRunner:
             if _msn:
                 message = _msn + "\n\n" + message
 
-            # Auto-continue: if the loaded history ends with a tool result,
+            # ── AUTONOMOUS_RESUME ────────────────────────────────────────────
+            # If feishu_wakeup.py sends a message starting with [AUTONOMOUS_RESUME],
+            # this is a system-triggered restart recovery.
+            # Instead of a single system-prepend (which models treat as one reply
+            # and stop), we inject each pending task as a SEPARATE user message
+            # into the session store BEFORE the AUTONOMOUS_RESUME message.
+            # The model then processes them sequentially like a normal conversation.
+            if message.lstrip().startswith("[AUTONOMOUS_RESUME]"):
+                _resume_file = os.path.expanduser("~/.hermes/PENDING_TASK.md")
+                _pending_content = ""
+                if os.path.exists(_resume_file):
+                    try:
+                        with open(_resume_file) as _f:
+                            _pending_content = _f.read()
+                    except Exception:
+                        pass
+
+                # Inject pending tasks as separate user messages (one per task section)
+                # so the model processes them sequentially, not as a single reply.
+                if _pending_content and session_key:
+                    _injected_count = 0
+                    try:
+                        # Parse PENDING_TASK.md into individual tasks
+                        _lines = _pending_content.splitlines()
+                        _current_task_lines = []
+                        _in_tasks_section = False
+
+                        for _line in _lines:
+                            # Start of a task section (### heading)
+                            if _line.startswith("### ") and not _line.startswith("### ✅") and not _line.startswith("### 🔄"):
+                                # Flush previous task if any
+                                if _current_task_lines and _in_tasks_section:
+                                    _task_text = "\n".join(_current_task_lines).strip()
+                                    if _task_text:
+                                        self._session_db.append_message(
+                                            session_id=session_key,
+                                            role="user",
+                                            content=_task_text,
+                                        )
+                                        _injected_count += 1
+                                _current_task_lines = [_line]
+                                _in_tasks_section = True
+                            elif _current_task_lines:
+                                _current_task_lines.append(_line)
+
+                        # Flush last task
+                        if _current_task_lines and _in_tasks_section:
+                            _task_text = "\n".join(_current_task_lines).strip()
+                            if _task_text:
+                                self._session_db.append_message(
+                                    session_id=session_key,
+                                    role="user",
+                                    content=_task_text,
+                                )
+                                _injected_count += 1
+
+                        if _injected_count > 0:
+                            logger.info(
+                                "AUTONOMOUS_RESUME: injected %d pending tasks into session %s",
+                                _injected_count, session_key
+                            )
+                    except Exception as _e:
+                        logger.warning("AUTONOMOUS_RESUME: failed to inject tasks: %s", _e)
+
+                # Replace the AUTONOMOUS_RESUME wrapper with a clear instruction.
+                # The model will see: [task1 msg] [task2 msg] ... [AUTONOMOUS_RESUME wrapper msg]
+                # and process them in order.
+                message = (
+                    "[System instruction — AUTONOMOUS RESUME]: "
+                    "The system just restarted. The messages above (injected before this one) "
+                    "are PENDING TASKS you must execute. Read each one carefully, execute it "
+                    "using your tools, then move to the next. Do NOT ask for confirmation. "
+                    "Do NOT wait for user input. Just execute, one by one. "
+                    "If a task is already marked ✅, skip it and continue to the next.]\n\n"
+                )
+
+            # ── Auto-continue: if the loaded history ends with a tool result,
             # the previous agent turn was interrupted mid-work (gateway
             # restart, crash, SIGTERM).  Prepend a system note so the model
             # finishes processing the pending tool results before addressing
