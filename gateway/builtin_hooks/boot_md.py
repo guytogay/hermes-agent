@@ -97,15 +97,47 @@ def _build_boot_prompt(content: str, spy_context: str = "") -> str:
     )
 
 
+def _resolve_boot_model():
+    """Read model config directly from config.yaml, bypassing gateway runtime path.
+    
+    The gateway runtime's _resolve_gateway_model() returns empty string in the boot-md
+    thread context (known bug: CLI vs runtime解析路径不一致).
+    We read the config file directly to get the correct values.
+    """
+    import yaml
+    try:
+        config_path = Path(HERMES_HOME) / "config.yaml"
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f)
+            model_cfg = cfg.get("model", {})
+            default_model = model_cfg.get("default", "MiniMax-M2.7-highspeed")
+            default_provider = model_cfg.get("provider", "minimax-cn")
+            return default_model, default_provider
+    except Exception as e:
+        logger.warning("Failed to read config.yaml for model: %s", e)
+    # Hardcoded fallback — must match config.yaml
+    return "MiniMax-M2.7-highspeed", "minimax-cn"
+
+
 def _run_boot_agent(content: str) -> None:
     """Spawn a one-shot agent session to execute the boot instructions."""
     try:
         from run_agent import AIAgent
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        # Read model directly from config.yaml to avoid gateway runtime bug
+        model, provider = _resolve_boot_model()
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
 
         # Pre-read spy observation log and inject into boot prompt
         spy_context = _inject_spy_context_to_memory()
         prompt = _build_boot_prompt(content, spy_context=spy_context)
         agent = AIAgent(
+            model=model,
+            provider=provider,
+            api_key=runtime_kwargs.get("api_key"),
+            base_url=runtime_kwargs.get("base_url"),
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,

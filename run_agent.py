@@ -995,6 +995,33 @@ class AIAgent:
         """
         _install_safe_stdio()
 
+        # Guard: refuse to create agent with empty model — this always causes
+        # "unknown model ''" API errors that are hard to debug.
+        if not model:
+            import logging as _logging
+            _logger = _logging.getLogger("hermes_cli")
+            _logger.error(
+                "AIAgent created with empty model! This would cause API errors. "
+                "provider=%s base_url=%s",
+                provider, base_url
+            )
+            # Try one level of auto-rescue: use the provider's default model.
+            _rescue_model = None
+            if provider:
+                try:
+                    from hermes_cli.models import get_default_model_for_provider
+                    _rescue_model = get_default_model_for_provider(provider)
+                except Exception:
+                    pass
+            if _rescue_model:
+                _logger.warning("Auto-rescued: using %s as model", _rescue_model)
+                model = _rescue_model
+            else:
+                raise ValueError(
+                    f"AIAgent model cannot be empty (provider={provider!r}). "
+                    "Check config.yaml model section."
+                )
+
         self.model = model
         self.max_iterations = max_iterations
         # Shared iteration budget — parent creates, children inherit.

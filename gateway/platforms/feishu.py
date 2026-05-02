@@ -2198,7 +2198,30 @@ class FeishuAdapter(BasePlatformAdapter):
         if not message_id or self._is_duplicate(message_id):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
-        if self._is_self_sent_bot_message(event):
+
+        # Peek at message content to check for AUTONOMOUS_RESUME.
+        # These messages are sent by this bot (feishu_wakeup.py) but should still
+        # trigger Hermes task chain, so we let them through.
+        _msg_content = ""
+        try:
+            _raw_content = getattr(message, "content", "") or ""
+            if _raw_content.startswith("{") or _raw_content.startswith("["):
+                import json as _json
+                _parsed = _json.loads(_raw_content)
+                if isinstance(_parsed, dict):
+                    _msg_content = str(_parsed.get("text", "") or "")
+                elif isinstance(_parsed, list):
+                    for _item in _parsed:
+                        if isinstance(_item, dict):
+                            _msg_content += str(_item.get("text", "") or "")
+            else:
+                _msg_content = _raw_content
+        except Exception:
+            pass
+
+        _is_autonomous_resume = "[AUTONOMOUS_RESUME]" in _msg_content
+
+        if self._is_self_sent_bot_message(event) and not _is_autonomous_resume:
             logger.debug("[Feishu] Dropping self-sent bot event: %s", message_id)
             return
 
